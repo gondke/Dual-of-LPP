@@ -2,6 +2,7 @@ import streamlit as st
 import numpy as np
 from scipy.optimize import linprog
 import plotly.graph_objects as go
+from scipy.spatial import ConvexHull
 
 st.set_page_config(
     page_title="LPP Duality & Visualization (2D/3D)",
@@ -80,6 +81,7 @@ else:
 # --- DUAL FORMULATION ---
 # Primal: Max c^T x s.t. A_ub x <= b_ub, x >= 0
 # Dual:   Min b_ub^T y s.t. A_ub^T y >= c_primal_canonical, y >= 0
+# Represent Dual as standard <= form: -A_ub^T y <= -c_primal_canonical
 b_dual = c_primal_canonical
 A_dual_ub = -A_ub.T
 c_dual = b_ub
@@ -136,40 +138,57 @@ st.markdown("""
 - **Strong Duality:** At optimum, the feasible bounds align perfectly, eliminating slack and making $Z^* = W^*$.
 """)
 
-# --- VISUALIZATION FUNCTIONS ---
+# --- ROBUST VISUALIZATION FUNCTIONS ---
 
 def plot_2d_region(A_ineq, b_ineq, title, var_names, opt_point):
     fig = go.Figure()
-    x1_vals = np.linspace(0, 8, 150)
-    x2_vals = np.linspace(0, 8, 150)
+
+    # Dynamic upper range based on optimal point or constraints
+    max_range = 10.0
+    if opt_point is not None and len(opt_point) >= 2:
+        max_range = max(10.0, np.max(opt_point) * 2.5)
+
+    x1_vals = np.linspace(0, max_range, 200)
+    x2_vals = np.linspace(0, max_range, 200)
     X1, X2 = np.meshgrid(x1_vals, x2_vals)
-    
+
     feasible_mask = (X1 >= 0) & (X2 >= 0)
     for row_a, val_b in zip(A_ineq, b_ineq):
-        feasible_mask &= (row_a[0]*X1 + row_a[1]*X2 <= val_b)
-        
-        if abs(row_a[1]) > 1e-5:
-            y_line = (val_b - row_a[0]*x1_vals) / row_a[1]
-            fig.add_trace(go.Scatter(x=x1_vals, y=y_line, mode='lines', name=f"{row_a[0]}{var_names[0]} + {row_a[1]}{var_names[1]} <= {val_b:.1f}"))
-        else:
-            x_val = val_b / row_a[0]
-            fig.add_trace(go.Scatter(x=[x_val, x_val], y=[0, 8], mode='lines', name=f"{row_a[0]}{var_names[0]} <= {val_b:.1f}"))
+        feasible_mask &= (row_a[0] * X1 + row_a[1] * X2 <= val_b)
 
+        if abs(row_a[1]) > 1e-5:
+            y_line = (val_b - row_a[0] * x1_vals) / row_a[1]
+            valid = (y_line >= 0) & (y_line <= max_range)
+            fig.add_trace(go.Scatter(
+                x=x1_vals[valid], y=y_line[valid], mode='lines',
+                name=f"{row_a[0]:.1f}{var_names[0]} + {row_a[1]:.1f}{var_names[1]} <= {val_b:.1f}"
+            ))
+        else:
+            if abs(row_a[0]) > 1e-5:
+                x_val = val_b / row_a[0]
+                if 0 <= x_val <= max_range:
+                    fig.add_trace(go.Scatter(
+                        x=[x_val, x_val], y=[0, max_range], mode='lines',
+                        name=f"{row_a[0]:.1f}{var_names[0]} <= {val_b:.1f}"
+                    ))
+
+    # Draw shaded feasible region contour
     fig.add_trace(go.Contour(
         z=feasible_mask.astype(int),
         x=x1_vals,
         y=x2_vals,
         showscale=False,
-        colorscale=[[0, 'rgba(0,0,0,0)'], [1, 'rgba(0, 150, 255, 0.35)']],
-        name="Feasible Region"
+        colorscale=[[0, 'rgba(0,0,0,0)'], [1, 'rgba(0, 150, 255, 0.4)']],
+        name="Feasible Region",
+        hoverinfo='skip'
     ))
 
     if opt_point is not None and len(opt_point) >= 2:
         fig.add_trace(go.Scatter(
             x=[opt_point[0]], y=[opt_point[1]],
             mode='markers+text',
-            marker=dict(color='red', size=12),
-            text=["Optimal Solution"],
+            marker=dict(color='red', size=14, symbol='star'),
+            text=["Optimum"],
             textposition="top right",
             name="Optimum"
         ))
@@ -178,44 +197,52 @@ def plot_2d_region(A_ineq, b_ineq, title, var_names, opt_point):
         title=title,
         xaxis_title=var_names[0],
         yaxis_title=var_names[1],
-        xaxis=dict(range=[0, 8]),
-        yaxis=dict(range=[0, 8]),
+        xaxis=dict(range=[0, max_range]),
+        yaxis=dict(range=[0, max_range]),
         height=500
     )
     return fig
 
+
 def plot_3d_region(A_ineq, b_ineq, title, var_names, opt_point):
     fig = go.Figure()
-    grid_res = 35
-    v1 = np.linspace(0, 6, grid_res)
-    v2 = np.linspace(0, 6, grid_res)
-    v3 = np.linspace(0, 6, grid_res)
-    V1, V2, V3 = np.meshgrid(v1, v2, v3)
+
+    max_range = 8.0
+    if opt_point is not None and len(opt_point) == 3:
+        max_range = max(8.0, np.max(opt_point) * 2.0)
+
+    # Grid sampling to extract valid interior vertices for 3D Mesh
+    grid = np.linspace(0, max_range, 25)
+    V1, V2, V3 = np.meshgrid(grid, grid, grid)
 
     feasible_mask = (V1 >= 0) & (V2 >= 0) & (V3 >= 0)
     for row_a, val_b in zip(A_ineq, b_ineq):
-        feasible_mask &= (row_a[0]*V1 + row_a[1]*V2 + row_a[2]*V3 <= val_b)
+        feasible_mask &= (row_a[0] * V1 + row_a[1] * V2 + row_a[2] * V3 <= val_b)
 
-    # 3D Feasible Volume
-    fig.add_trace(go.Volume(
-        x=V1.flatten(),
-        y=V2.flatten(),
-        z=V3.flatten(),
-        value=feasible_mask.flatten().astype(float),
-        isomin=0.5,
-        isomax=1.0,
-        opacity=0.3,
-        surface_count=2,
-        colorscale='Blues',
-        name="Feasible Region"
-    ))
+    pts = np.vstack((V1[feasible_mask], V2[feasible_mask], V3[feasible_mask])).T
 
-    # Add Optimal Point
+    if len(pts) > 4:
+        try:
+            hull = ConvexHull(pts)
+            fig.add_trace(go.Mesh3d(
+                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+                i=hull.simplices[:, 0], j=hull.simplices[:, 1], k=hull.simplices[:, 2],
+                color='cyan', opacity=0.4, name="Feasible Region"
+            ))
+        except Exception:
+            fig.add_trace(go.Scatter3d(
+                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+                mode='markers', marker=dict(size=3, color='blue', opacity=0.3),
+                name="Feasible Points"
+            ))
+    else:
+        st.warning(f"Feasible region for {title} is bounded or outside default rendering window.")
+
     if opt_point is not None and len(opt_point) == 3:
         fig.add_trace(go.Scatter3d(
             x=[opt_point[0]], y=[opt_point[1]], z=[opt_point[2]],
             mode='markers+text',
-            marker=dict(color='red', size=8),
+            marker=dict(color='red', size=10, symbol='diamond'),
             text=["Optimum"],
             textposition="top center",
             name="Optimum"
@@ -227,10 +254,35 @@ def plot_3d_region(A_ineq, b_ineq, title, var_names, opt_point):
             xaxis_title=var_names[0],
             yaxis_title=var_names[1],
             zaxis_title=var_names[2],
-            xaxis=dict(range=[0, 6]),
-            yaxis=dict(range=[0, 6]),
-            zaxis=dict(range=[0, 6]),
+            xaxis=dict(range=[0, max_range]),
+            yaxis=dict(range=[0, max_range]),
+            zaxis=dict(range=[0, max_range]),
         ),
         height=500
     )
     return fig
+
+
+# --- RENDER GRAPHICAL PLOTS ---
+st.header("Geometric Visualizations (2D / 3D)")
+
+vcol1, vcol2 = st.columns(2)
+
+with vcol1:
+    st.subheader("Primal Feasible Region")
+    if num_vars == 2:
+        fig_p = plot_2d_region(A_ub, b_ub, "Primal Region (2D)", ["x1", "x2"], res_primal.x if res_primal.success else None)
+        st.plotly_chart(fig_p, use_container_width=True)
+    elif num_vars == 3:
+        fig_p = plot_3d_region(A_ub, b_ub, "Primal Region (3D)", ["x1", "x2", "x3"], res_primal.x if res_primal.success else None)
+        st.plotly_chart(fig_p, use_container_width=True)
+
+with vcol2:
+    st.subheader("Dual Feasible Region")
+    num_dual_vars = num_constraints  # Dual dimension = number of primal constraints
+    if num_dual_vars == 2:
+        fig_d = plot_2d_region(A_dual_ub, -b_dual, "Dual Region (2D)", ["y1", "y2"], res_dual.x if res_dual.success else None)
+        st.plotly_chart(fig_d, use_container_width=True)
+    elif num_dual_vars == 3:
+        fig_d = plot_3d_region(A_dual_ub, -b_dual, "Dual Region (3D)", ["y1", "y2", "y3"], res_dual.x if res_dual.success else None)
+        st.plotly_chart(fig_d, use_container_width=True)
